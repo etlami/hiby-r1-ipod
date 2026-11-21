@@ -1,0 +1,10 @@
+build/src/
+build/out/
+__pycache__/
+*.pyc
+.DS_Store
+*.db
+*.pkl
+*.m3u
+*.json
+!tools/**/example*.json

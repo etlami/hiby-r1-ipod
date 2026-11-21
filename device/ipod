@@ -1,0 +1,3 @@
+#!/bin/sh
+# Startet den iPod-Client: erst Pause, bis das Radio PlayControl schickt (sonst bleibt der Ton stumm)
+IPOD_START_PAUSED=1 exec /usr/data/ipod.bin "$@"

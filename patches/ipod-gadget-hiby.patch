@@ -1,0 +1,125 @@
+diff --git a/gadget/ipod_audio.c b/gadget/ipod_audio.c
+index 2eb33dd..a1de8b1 100755
+--- a/gadget/ipod_audio.c
++++ b/gadget/ipod_audio.c
+@@ -1,3 +1,4 @@
++#include <linux/version.h>
+ #define pr_fmt(fmt) "ipod-gadget-audio: " fmt
+ 
+ #include <linux/kernel.h>
+@@ -586,7 +587,13 @@ static int ipod_audio_bind(struct usb_configuration *conf, struct usb_function *
+ 	audio->pcm->private_data = audio;
+ 
+ 	snd_pcm_set_ops(audio->pcm, SNDRV_PCM_STREAM_PLAYBACK, &ipod_audio_pcm_ops);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5,5,0)
++	/* alte Kernel: device=NULL heisst gfp=0 -> 64-KB-Allokation schlaegt fehl; vorab reservieren */
++	snd_pcm_lib_preallocate_pages_for_all(audio->pcm, SNDRV_DMA_TYPE_CONTINUOUS,
++		snd_dma_continuous_data(GFP_KERNEL), BUFFER_BYTES_MAX, BUFFER_BYTES_MAX);
++#else
+ 	snd_pcm_lib_preallocate_pages_for_all(audio->pcm, SNDRV_DMA_TYPE_CONTINUOUS, NULL, 0, BUFFER_BYTES_MAX);
++#endif
+ 	ret = snd_card_register(audio->card);
+ 	if (ret)
+ 	{
+diff --git a/gadget/ipod_gadget.c b/gadget/ipod_gadget.c
+index 369719b..743b29a 100755
+--- a/gadget/ipod_gadget.c
++++ b/gadget/ipod_gadget.c
+@@ -23,6 +23,10 @@ static bool swap_configs = false;
+ module_param(swap_configs, bool, 0);
+ MODULE_PARM_DESC(swap_configs, "Present iPod USB config as #1");
+ 
++static bool high_speed = false;
++module_param(high_speed, bool, 0);
++MODULE_PARM_DESC(high_speed, "Allow USB high speed like a real iPod/iPhone");
++
+ static ushort product_id = 0;
+ module_param(product_id, ushort, 0);
+ MODULE_PARM_DESC(product_id, "Override USB Product ID");
+@@ -207,6 +211,36 @@ static struct usb_composite_driver ipod_driver = {
+ 
+ 
+ 
++
++/* Kernel < 4.7: composite_setup reicht Vendor-Requests mit Empfänger "Gerät"
++ * erst NACH SET_CONFIGURATION an Funktionen weiter (kein config0 in req_match).
++ * Radios schicken Apples 0x40 (Ladestrom) aber vorher -> STALL -> Abbruch.
++ * Darum: Setup-Callback des Gadget-Treibers umbiegen und 0x40 selbst quittieren. */
++#include <linux/version.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4,7,0)
++static int (*ipod_orig_setup)(struct usb_gadget *, const struct usb_ctrlrequest *);
++static int ipod_setup_hook(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
++{
++	if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_VENDOR && ctrl->bRequest == 0x40) {
++		struct usb_composite_dev *cdev = get_gadget_data(gadget);
++		struct usb_request *req = cdev->req;
++		int ret;
++		pr_info("apple vendor 0x40 (v%04x i%04x l%d) quittiert\n",
++			le16_to_cpu(ctrl->wValue), le16_to_cpu(ctrl->wIndex), le16_to_cpu(ctrl->wLength));
++		req->length = 0;
++		req->zero = 0;
++		ret = usb_ep_queue(gadget->ep0, req, GFP_ATOMIC);
++		if (ret < 0)
++			pr_err("0x40 ep_queue %d\n", ret);
++		return ret;
++	}
++	if ((ctrl->bRequestType & USB_TYPE_MASK) != USB_TYPE_STANDARD)
++		pr_info("ctrl %02x.%02x v%04x i%04x l%d\n", ctrl->bRequestType, ctrl->bRequest,
++			le16_to_cpu(ctrl->wValue), le16_to_cpu(ctrl->wIndex), le16_to_cpu(ctrl->wLength));
++	return ipod_orig_setup(gadget, ctrl);
++}
++#endif
++
+ static int __init ipod_init(void)
+ {
+ 	pr_info("init\n");
+@@ -217,12 +251,32 @@ static int __init ipod_init(void)
+ 		pr_info("swapping usb configuration: ipod is #1\n");
+ 	}
+ 
++	if(high_speed) {
++		ipod_driver.max_speed = USB_SPEED_HIGH;
++		pr_info("high speed erlaubt\n");
++	}
++
+ 	if(product_id != 0) {
+ 		device_desc.idProduct = cpu_to_le16(product_id);
+ 		pr_info("override usb idProduct: %04x\n", product_id);
+ 	}
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4,7,0)
++	{
++		int ret;
++		/* Hook VOR dem Binden setzen: usb_composite_probe kopiert die Vorlage
++		 * nach ipod_driver.gadget_driver und bindet dann an den UDC. */
++		ret = usb_composite_probe(&ipod_driver);
++		if (ret)
++			return ret;
++		ipod_orig_setup = ipod_driver.gadget_driver.setup;
++		ipod_driver.gadget_driver.setup = ipod_setup_hook;
++		pr_info("setup-hook fuer apple 0x40 aktiv\n");
++		return 0;
++	}
++#else
+ 	return usb_composite_probe(&ipod_driver);
++#endif
+ 	
+ }
+ 
+diff --git a/gadget/ipod_hid.c b/gadget/ipod_hid.c
+index eae74de..b58ee75 100755
+--- a/gadget/ipod_hid.c
++++ b/gadget/ipod_hid.c
+@@ -306,7 +306,12 @@ static const struct file_operations ipod_hid_dev_ops = {
+ };
+ 
+ // usb
++#include <linux/version.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4,7,0)
++static bool ipod_hid_req_match(struct usb_function *func,const struct usb_ctrlrequest *ctrl) {
++#else
+ static bool ipod_hid_req_match(struct usb_function *func,const struct usb_ctrlrequest *ctrl,bool config0) {
++#endif
+ 	switch(ctrl->bRequest) {
+ 	case 0x40:
+ 		return true;

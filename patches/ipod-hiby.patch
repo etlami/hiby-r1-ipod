@@ -1,0 +1,714 @@
+diff --git a/cmd.go b/cmd.go
+index 20fb06e..425f0f8 100644
+--- a/cmd.go
++++ b/cmd.go
+@@ -181,9 +181,15 @@ func Respond(req *Command, pw CommandWriter, payload interface{}) {
+ 		return
+ 	}
+ 	cmd.Transaction = req.Transaction.Copy()
++	if req.Transaction == nil {
++		atomic.StoreUint32(&noTrx, 1)
++	}
+ 	pw.WriteCommand(cmd)
+ }
+ 
++// noTrx: Zubehör nutzt keine Transaktions-IDs (altes iAP) -> eigene Sends auch ohne
++var noTrx uint32
++
+ var trxCounter uint32
+ 
+ func TrxReset() {
+@@ -199,7 +205,9 @@ func Send(pw CommandWriter, payload interface{}) {
+ 	if err != nil {
+ 		return
+ 	}
+-	cmd.Transaction = TrxNext()
++	if atomic.LoadUint32(&noTrx) == 0 {
++		cmd.Transaction = TrxNext()
++	}
+ 	pw.WriteCommand(cmd)
+ }
+ 
+diff --git a/cmd/ipod/bluez.go b/cmd/ipod/bluez.go
+index 7d85fef..426accb 100644
+--- a/cmd/ipod/bluez.go
++++ b/cmd/ipod/bluez.go
+@@ -38,6 +38,11 @@ type BluezPlayer struct {
+ 
+ func NewBluezPlayer(onTrackChange func(index int32)) *BluezPlayer {
+ 	bp := &BluezPlayer{onTrackChange: onTrackChange}
++	// HiBy: kein BlueZ-Autoconnect/Discoverable – nur Fallback-Wiedergabestatus
++	if os.Getenv("IPOD_NO_BLUEZ") != "" {
++		log.Info("bluez: deaktiviert (IPOD_NO_BLUEZ), fallback playback state")
++		return bp
++	}
+ 	conn, err := dbus.SystemBus()
+ 	if err != nil {
+ 		log.WithError(err).Warn("bluez: no system D-Bus, using fallback playback state")
+diff --git a/cmd/ipod/main.go b/cmd/ipod/main.go
+index a11c043..dba8ec6 100644
+--- a/cmd/ipod/main.go
++++ b/cmd/ipod/main.go
+@@ -1,9 +1,12 @@
+ package main
+ 
+ import (
++	"encoding/binary"
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"os"
+@@ -103,6 +106,21 @@ func main() {
+ 			log.SetLevel(logrus.DebugLevel)
+ 		}
+ 
++		if os.Getenv("IPOD_NO_R4") != "" {
++			// IN-Report 0x04 (63+1 = 64 Byte = wMaxPacketSize) meiden -> Fragmentierung in 0x01-0x03.
++			// 0x05-0x09 sind laut Deskriptor OUT (Radio->iPod) und bleiben fuers Dekodieren.
++			var d hid.ReportDefs
++			for _, r := range hid.DefaultReportDefs {
++				if r.ID == 0x04 {
++					continue
++				}
++				if r.ID >= 0x05 {
++					r.Dir = hid.ReportDirAccOut
++				}
++				d = append(d, r)
++			}
++			hidReportDefs = d
++		}
+ 		if c.GlobalBool("legacy") {
+ 			hidReportDefs = hid.LegacyReportDefs
+ 		}
+@@ -369,19 +387,21 @@ func processFrames(frameTransport ipod.FrameReadWriter) {
+ 			handlePacket(&outCmdBuf, inCmdBuf.Commands[i])
+ 		}
+ 
+-		for i := range outCmdBuf.Commands {
+-			outCmd := outCmdBuf.Commands[i]
++		asyncSend = func(outCmd *ipod.Command) {
++			sendMu.Lock()
++			defer sendMu.Unlock()
+ 			logCmd(outCmd, nil, ">> CMD")
+-
+ 			outPacket, err := serde.MarshalCmd(outCmd)
+ 			logPacket(outPacket, err, ">> PACKET")
+-
+ 			packetWriter := ipod.NewPacketWriter()
+ 			packetWriter.WritePacket(outPacket)
+ 			outFrame := packetWriter.Bytes()
+ 			outFrameErr := frameTransport.WriteFrame(outFrame)
+ 			logFrame(outFrame, outFrameErr, ">> FRAME")
+ 		}
++		for i := range outCmdBuf.Commands {
++			asyncSend(outCmdBuf.Commands[i])
++		}
+ 
+ 	}
+ 	log.Warnf("EOF")
+@@ -415,12 +435,29 @@ func (d *DevExtRemote) PlaybackStatus() (uint32, uint32, extremote.PlayerState)
+ 		}
+ 		return dur, pos, state
+ 	}
+-	const trackLen = 300 * 1000
++	trackLen := uint32(300 * 1000)
+ 	pos := uint32(time.Since(d.start).Milliseconds()) % trackLen
++	if t := currentTrack(); t != nil {
++		if t.durMs > 0 {
++			trackLen = t.durMs
++		}
++		pos = uint32(time.Since(t.start).Milliseconds())
++		if pos > trackLen {
++			pos = trackLen
++		}
++	}
++	if os.Getenv("IPOD_START_PAUSED") != "" && atomic.LoadUint32(&gotPlay) == 0 {
++		return trackLen, pos, extremote.PlayerStatePaused
++	}
+ 	return trackLen, pos, extremote.PlayerStatePlaying
+ }
+ 
++var gotPlay uint32
++
+ func (d *DevExtRemote) TrackInfo() (string, string, string, int32, int32, bool) {
++	if t := currentTrack(); t != nil {
++		return t.title, t.artist, t.album, t.index, 9999, true
++	}
+ 	title, artist, album, _, _, _, index, ok := d.bluez.Snapshot()
+ 	if !ok {
+ 		return "", "", "", 0, 0, false
+@@ -434,6 +471,16 @@ func (d *DevExtRemote) SetTrackIndex(index int32) {
+ }
+ 
+ func (d *DevExtRemote) PlayControl(cmd extremote.PlayControlCmd) {
++	log.Infof("PlayControl vom Radio: %v", cmd)
++	atomic.StoreUint32(&gotPlay, 1)
++	// HiBy-Player per Tastendruck steuern (Weiter: Geraetetasten event0, Zurueck: event2).
++	// Play/Pause-Toggles ignorieren wir: das Radio schickt beim Verbinden selbst ein Toggle.
++	switch cmd {
++	case extremote.PlayControlNextTrack, extremote.PlayControlNext:
++		injectKey("/dev/input/event0", 163)
++	case extremote.PlayControlPrevTrack, extremote.PlayControlPrev:
++		injectKey("/dev/input/event2", 165)
++	}
+ 	var op string
+ 	switch cmd {
+ 	case extremote.PlayControlToggle:
+@@ -462,12 +509,18 @@ var devExtRemote = &DevExtRemote{start: time.Now()}
+ func handlePacket(cmdWriter ipod.CommandWriter, cmd *ipod.Command) {
+ 	switch cmd.ID.LingoID() {
+ 	case ipod.LingoGeneralID:
++		general.HandleGeneral(cmd, cmdWriter, devGeneral)
++		// wie libiap: Audio erst NACH erfolgreicher Authentifizierung anstoßen
++		// wie libiap: nach erfolgreicher Auth die Audio-Absprache (erneut) anstossen
++		if _, ok := cmd.Payload.(*general.RetDevAuthenticationSignature); ok {
++			audio.Start(cmdWriter)
++		}
++		// Audio nach letztem Zertifikatsteil anstossen (Signatur kommt erst nach ~50 s)
+ 		if auth, ok := cmd.Payload.(*general.RetDevAuthenticationInfo); ok {
+ 			if auth.Major >= 2 && auth.CertCurrentSection >= auth.CertMaxSection || auth.Major < 2 {
+ 				audio.Start(cmdWriter)
+ 			}
+ 		}
+-		general.HandleGeneral(cmd, cmdWriter, devGeneral)
+ 
+ 	case ipod.LingoSimpleRemoteID:
+ 		//todo
+@@ -476,6 +529,10 @@ func handlePacket(cmdWriter ipod.CommandWriter, cmd *ipod.Command) {
+ 		dispremote.HandleDispRemote(cmd, cmdWriter, nil)
+ 	case ipod.LingoExtRemoteID:
+ 		extremote.HandleExtRemote(cmd, cmdWriter, devExtRemote)
++		if n, ok := cmd.Payload.(*extremote.SetPlayStatusChangeNotificationShort); ok && n.Enabled {
++			startNotify(cmdWriter)
++			go autoPlay()
++		}
+ 	case ipod.LingoDigitalAudioID:
+ 		audio.HandleAudio(cmd, cmdWriter, nil)
+ 	}
+@@ -541,3 +598,76 @@ func dumpTrace(tr *trace.Reader) {
+ 	}
+ 	log.Warnf("EOF")
+ }
++
++var notifyOnce sync.Once
++var sendMu sync.Mutex
++var asyncSend func(*ipod.Command)
++
++// startNotify schickt wie ein echter iPod jede Sekunde die Spielposition.
++func startNotify(w ipod.CommandWriter) {
++	notifyOnce.Do(func() {
++		go watchNowPlaying()
++		go func() {
++			for range time.Tick(time.Second) {
++				_, pos, _ := devExtRemote.PlaybackStatus()
++				buf := ipod.CmdBuffer{}
++				ipod.Send(&buf, &extremote.PlayStatusChangeNotification{Status: 0x04, Value: pos})
++				if f := asyncSend; f != nil {
++					for _, c := range buf.Commands {
++						f(c)
++					}
++				}
++			}
++		}()
++	})
++}
++
++// injectKey schreibt Druecken+Loslassen einer Taste in ein evdev-Geraet (32-bit input_event).
++func injectKey(dev string, code uint16) {
++	f, err := os.OpenFile(dev, os.O_WRONLY, 0)
++	if err != nil {
++		log.Warnf("injectKey %s: %v", dev, err)
++		return
++	}
++	defer f.Close()
++	ev := func(typ, c uint16, val int32) []byte {
++		b := make([]byte, 16)
++		binary.LittleEndian.PutUint16(b[8:], typ)
++		binary.LittleEndian.PutUint16(b[10:], c)
++		binary.LittleEndian.PutUint32(b[12:], uint32(val))
++		return b
++	}
++	var buf []byte
++	buf = append(buf, ev(1, code, 1)...)
++	buf = append(buf, ev(0, 0, 0)...)
++	buf = append(buf, ev(1, code, 0)...)
++	buf = append(buf, ev(0, 0, 0)...)
++	f.Write(buf)
++	log.Infof("Taste %d an %s", code, dev)
++}
++
++var autoPlayMu sync.Mutex
++
++// playerSpielt: pcmshim.so beruehrt /tmp/pcm_alive jede Sekunde, solange der Player Ton schreibt.
++func playerSpielt() bool {
++	st, err := os.Stat("/tmp/pcm_alive")
++	return err == nil && time.Since(st.ModTime()) < 3*time.Second
++}
++
++// autoPlay: Radio hat sich verbunden -> wenn der Player nicht spielt, einmal Play/Pause druecken
++// (Player macht dort weiter, wo er war).
++func autoPlay() {
++	if !autoPlayMu.TryLock() {
++		return
++	}
++	defer autoPlayMu.Unlock()
++	time.Sleep(4 * time.Second)
++	if playerSpielt() {
++		log.Info("AutoPlay: Player spielt schon")
++		return
++	}
++	log.Info("AutoPlay: Player spielt nicht -> Play")
++	injectKey("/dev/input/event2", 164)
++	time.Sleep(4 * time.Second)
++	log.Infof("AutoPlay: spielt jetzt=%v", playerSpielt())
++}
+diff --git a/cmd/ipod/nowplaying.go b/cmd/ipod/nowplaying.go
+new file mode 100644
+index 0000000..801216b
+--- /dev/null
++++ b/cmd/ipod/nowplaying.go
+@@ -0,0 +1,367 @@
++package main
++
++// Aktueller Titel des HiBy-Players: pcmshim.so schreibt den Pfad jeder vom Player
++// geoeffneten Audiodatei nach /tmp/now_playing. Wir lesen Tags + Dauer aus der Datei
++// und melden dem Radio Titelwechsel per PlayStatusChangeNotification.
++
++import (
++	"bytes"
++	"encoding/binary"
++	"io"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/oandrew/ipod"
++	"github.com/oandrew/ipod/lingo-extremote"
++)
++
++
++type trackMeta struct {
++	path, title, artist, album string
++	durMs                      uint32
++	start                      time.Time
++	index                      int32
++}
++
++var (
++	npMu  sync.Mutex
++	np    *trackMeta
++	npIdx int32
++)
++
++func currentTrack() *trackMeta {
++	npMu.Lock()
++	defer npMu.Unlock()
++	return np
++}
++
++func watchNowPlaying() {
++	last := ""
++	for range time.Tick(500 * time.Millisecond) {
++		p := playerAudioFile()
++		if p == "" || p == last {
++			continue
++		}
++		last = p
++		m := readMeta(p)
++		npMu.Lock()
++		npIdx++
++		m.index = npIdx
++		m.start = time.Now()
++		np = m
++		npMu.Unlock()
++		log.Infof("Titel: %q – %q (%q) %d ms", m.artist, m.title, m.album, m.durMs)
++		if f := asyncSend; f != nil {
++			buf := ipod.CmdBuffer{}
++			ipod.Send(&buf, &extremote.PlayStatusChangeNotification{Status: 0x01, Value: uint32(m.index)})
++			for _, c := range buf.Commands {
++				f(c)
++			}
++		}
++	}
++}
++
++var reTrackNr = regexp.MustCompile(`^\d+\s*[-._]\s*`)
++var reYear = regexp.MustCompile(`^\d{4}\s*-\s*`)
++
++func readMeta(p string) *trackMeta {
++	m := &trackMeta{path: p}
++	// Fallback aus dem Pfad: Interpret/JJJJ - Album/NN - Titel.ext
++	base := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
++	m.title = reTrackNr.ReplaceAllString(base, "")
++	dir := filepath.Dir(p)
++	m.album = reYear.ReplaceAllString(filepath.Base(dir), "")
++	m.artist = filepath.Base(filepath.Dir(dir))
++
++	f, err := os.Open(p)
++	if err != nil {
++		return m
++	}
++	defer f.Close()
++	head := make([]byte, 256*1024)
++	n, _ := io.ReadFull(f, head)
++	head = head[:n]
++	var tags map[string]string
++	switch {
++	case bytes.HasPrefix(head, []byte("OggS")):
++		tags = oggTags(head)
++		m.durMs = oggDuration(f, head)
++	case bytes.HasPrefix(head, []byte("fLaC")):
++		tags, m.durMs = flacMeta(head)
++	case bytes.HasPrefix(head, []byte("ID3")):
++		tags = id3Tags(head)
++	}
++	if v := tags["TITLE"]; v != "" {
++		m.title = v
++	}
++	if v := tags["ARTIST"]; v != "" {
++		m.artist = v
++	}
++	if v := tags["ALBUM"]; v != "" {
++		m.album = v
++	}
++	return m
++}
++
++func vorbisComments(b []byte) map[string]string {
++	t := map[string]string{}
++	if len(b) < 8 {
++		return t
++	}
++	vl := int(binary.LittleEndian.Uint32(b))
++	o := 4 + vl
++	if o+4 > len(b) {
++		return t
++	}
++	cnt := int(binary.LittleEndian.Uint32(b[o:]))
++	o += 4
++	for i := 0; i < cnt && o+4 <= len(b); i++ {
++		l := int(binary.LittleEndian.Uint32(b[o:]))
++		o += 4
++		if l < 0 || o+l > len(b) {
++			break
++		}
++		kv := string(b[o : o+l])
++		o += l
++		if k, v, ok := strings.Cut(kv, "="); ok {
++			k = strings.ToUpper(k)
++			if _, dup := t[k]; !dup {
++				t[k] = v
++			}
++		}
++	}
++	return t
++}
++
++// oggTags sucht OpusTags bzw. Vorbis-Kommentar im (ggf. seitenuebergreifenden) Kopf.
++func oggTags(head []byte) map[string]string {
++	// Ogg-Seiten zu einem Paketstrom zusammensetzen (Kopf reicht fuer Tags)
++	var stream []byte
++	o := 0
++	for o+27 <= len(head) && bytes.Equal(head[o:o+4], []byte("OggS")) {
++		segs := int(head[o+26])
++		if o+27+segs > len(head) {
++			break
++		}
++		l := 0
++		for _, s := range head[o+27 : o+27+segs] {
++			l += int(s)
++		}
++		start := o + 27 + segs
++		if start+l > len(head) {
++			stream = append(stream, head[start:]...)
++			break
++		}
++		stream = append(stream, head[start:start+l]...)
++		o = start + l
++	}
++	if i := bytes.Index(stream, []byte("OpusTags")); i >= 0 {
++		return vorbisComments(stream[i+8:])
++	}
++	if i := bytes.Index(stream, []byte("\x03vorbis")); i >= 0 {
++		return vorbisComments(stream[i+7:])
++	}
++	return nil
++}
++
++func oggDuration(f *os.File, head []byte) uint32 {
++	rate := uint64(48000)
++	preskip := uint64(0)
++	if i := bytes.Index(head, []byte("OpusHead")); i >= 0 && i+12 <= len(head) {
++		preskip = uint64(binary.LittleEndian.Uint16(head[i+10:]))
++	} else if i := bytes.Index(head, []byte("\x01vorbis")); i >= 0 && i+16 <= len(head) {
++		rate = uint64(binary.LittleEndian.Uint32(head[i+12:]))
++	}
++	st, err := f.Stat()
++	if err != nil || rate == 0 {
++		return 0
++	}
++	sz := st.Size()
++	tail := int64(64 * 1024)
++	if tail > sz {
++		tail = sz
++	}
++	buf := make([]byte, tail)
++	if _, err := f.ReadAt(buf, sz-tail); err != nil && err != io.EOF {
++		return 0
++	}
++	i := bytes.LastIndex(buf, []byte("OggS"))
++	if i < 0 || i+14 > len(buf) {
++		return 0
++	}
++	g := binary.LittleEndian.Uint64(buf[i+6:])
++	if g <= preskip {
++		return 0
++	}
++	return uint32((g - preskip) * 1000 / rate)
++}
++
++func flacMeta(head []byte) (map[string]string, uint32) {
++	var tags map[string]string
++	var dur uint32
++	o := 4
++	for o+4 <= len(head) {
++		last := head[o]&0x80 != 0
++		typ := head[o] & 0x7f
++		l := int(head[o+1])<<16 | int(head[o+2])<<8 | int(head[o+3])
++		o += 4
++		if o+l > len(head) {
++			break
++		}
++		blk := head[o : o+l]
++		switch typ {
++		case 0:
++			if len(blk) >= 18 {
++				rate := uint64(blk[10])<<12 | uint64(blk[11])<<4 | uint64(blk[12])>>4
++				total := uint64(blk[13]&0x0f)<<32 | uint64(binary.BigEndian.Uint32(blk[14:]))
++				if rate > 0 {
++					dur = uint32(total * 1000 / rate)
++				}
++			}
++		case 4:
++			tags = vorbisComments(blk)
++		}
++		o += l
++		if last {
++			break
++		}
++	}
++	return tags, dur
++}
++
++func id3Tags(head []byte) map[string]string {
++	t := map[string]string{}
++	if len(head) < 10 {
++		return t
++	}
++	ver := head[3]
++	size := int(head[6]&0x7f)<<21 | int(head[7]&0x7f)<<14 | int(head[8]&0x7f)<<7 | int(head[9]&0x7f)
++	o := 10
++	end := 10 + size
++	if end > len(head) {
++		end = len(head)
++	}
++	names := map[string]string{"TIT2": "TITLE", "TPE1": "ARTIST", "TALB": "ALBUM"}
++	for o+10 <= end {
++		id := string(head[o : o+4])
++		var l int
++		if ver >= 4 {
++			l = int(head[o+4]&0x7f)<<21 | int(head[o+5]&0x7f)<<14 | int(head[o+6]&0x7f)<<7 | int(head[o+7]&0x7f)
++		} else {
++			l = int(binary.BigEndian.Uint32(head[o+4:]))
++		}
++		o += 10
++		if id[0] == 0 || l <= 0 || o+l > end {
++			break
++		}
++		if k, ok := names[id]; ok {
++			t[k] = id3Text(head[o : o+l])
++		}
++		o += l
++	}
++	return t
++}
++
++func id3Text(b []byte) string {
++	if len(b) < 1 {
++		return ""
++	}
++	enc, s := b[0], b[1:]
++	switch enc {
++	case 1, 2: // UTF-16
++		be := enc == 2
++		if len(s) >= 2 && s[0] == 0xff && s[1] == 0xfe {
++			be, s = false, s[2:]
++		} else if len(s) >= 2 && s[0] == 0xfe && s[1] == 0xff {
++			be, s = true, s[2:]
++		}
++		var r []rune
++		for i := 0; i+1 < len(s); i += 2 {
++			var c uint16
++			if be {
++				c = binary.BigEndian.Uint16(s[i:])
++			} else {
++				c = binary.LittleEndian.Uint16(s[i:])
++			}
++			if c == 0 {
++				break
++			}
++			r = append(r, rune(c))
++		}
++		return string(r)
++	case 0: // Latin-1
++		var r []rune
++		for _, c := range s {
++			if c == 0 {
++				break
++			}
++			r = append(r, rune(c))
++		}
++		return string(r)
++	}
++	return strings.TrimRight(string(s), "\x00")
++}
++
++var playerPid string
++
++// playerAudioFile liefert die Audiodatei, die hiby_player gerade offen hat (aus /proc/PID/fd).
++func playerAudioFile() string {
++	if playerPid == "" || !pidAlive(playerPid) {
++		playerPid = findPlayer()
++		if playerPid == "" {
++			return ""
++		}
++	}
++	dir := "/proc/" + playerPid + "/fd"
++	ents, err := os.ReadDir(dir)
++	if err != nil {
++		playerPid = ""
++		return ""
++	}
++	best, bestFd := "", -1
++	for _, e := range ents {
++		l, err := os.Readlink(dir + "/" + e.Name())
++		if err != nil || !isAudio(l) {
++			continue
++		}
++		fd := 0
++		for _, c := range e.Name() {
++			fd = fd*10 + int(c-'0')
++		}
++		if fd > bestFd {
++			best, bestFd = l, fd
++		}
++	}
++	return best
++}
++
++func pidAlive(pid string) bool {
++	l, err := os.Readlink("/proc/" + pid + "/exe")
++	return err == nil && strings.HasSuffix(l, "/hiby_player")
++}
++
++func findPlayer() string {
++	ents, _ := os.ReadDir("/proc")
++	for _, e := range ents {
++		n := e.Name()
++		if n[0] < '0' || n[0] > '9' {
++			continue
++		}
++		if pidAlive(n) {
++			return n
++		}
++	}
++	return ""
++}
++
++func isAudio(p string) bool {
++	switch strings.ToLower(filepath.Ext(p)) {
++	case ".opus", ".flac", ".mp3", ".m4a", ".ogg", ".wav", ".aac", ".ape", ".dsf", ".dff", ".wma", ".aiff":
++		return true
++	}
++	return false
++}
+diff --git a/lingo-extremote/extremote.go b/lingo-extremote/extremote.go
+index 48b43af..8af851e 100644
+--- a/lingo-extremote/extremote.go
++++ b/lingo-extremote/extremote.go
+@@ -385,7 +385,8 @@ type SetPlayStatusChangeNotificationShort struct {
+ 	Enabled bool
+ }
+ type PlayStatusChangeNotification struct {
+-	Status byte // finish
++	Status byte // 0x04 = Track-Zeit (ms) folgt
++	Value  uint32
+ }
+ type PlayCurrentSelection struct {
+ 	SelectedTrackIndex int32
+diff --git a/lingo-extremote/handler.go b/lingo-extremote/handler.go
+index b997021..5ea29a8 100644
+--- a/lingo-extremote/handler.go
++++ b/lingo-extremote/handler.go
+@@ -43,6 +43,9 @@ func ackSuccess(req *ipod.Command) *ACK {
+ // 	return ACKPending{Status: ACKStatusPending, CmdID: uint8(req.ID.CmdID()), MaxWait: maxWait}
+ // }
+ 
++var curRepeat = RepeatOff
++var curShuffle = ShuffleOff
++
+ func HandleExtRemote(req *ipod.Command, tr ipod.CommandWriter, dev DeviceExtRemote) error {
+ 	//log.Printf("Req: %#v", req)
+ 	switch msg := req.Payload.(type) {
+@@ -171,13 +174,16 @@ func HandleExtRemote(req *ipod.Command, tr ipod.CommandWriter, dev DeviceExtRemo
+ 	case *GetTrackArtworkTimes:
+ 		ipod.Respond(req, tr, &RetTrackArtworkTimes{})
+ 	case *GetShuffle:
+-		ipod.Respond(req, tr, &ReturnShuffle{Mode: ShuffleOff})
++		ipod.Respond(req, tr, &ReturnShuffle{Mode: curShuffle})
+ 	case *SetShuffle:
++		curShuffle = msg.Mode
+ 		ipod.Respond(req, tr, ackSuccess(req))
+ 
+ 	case *GetRepeat:
+-		ipod.Respond(req, tr, &ReturnRepeat{Mode: RepeatOff})
++		ipod.Respond(req, tr, &ReturnRepeat{Mode: curRepeat})
+ 	case *SetRepeat:
++		// Radio prueft per GetRepeat nach -> eingestellten Wert merken
++		curRepeat = msg.Mode
+ 		ipod.Respond(req, tr, ackSuccess(req))
+ 
+ 	case *SetDisplayImage:
+diff --git a/lingo-general/handler.go b/lingo-general/handler.go
+index 1c010bf..85f58e3 100644
+--- a/lingo-general/handler.go
++++ b/lingo-general/handler.go
+@@ -2,6 +2,8 @@ package general
+ 
+ import (
+ 	"bytes"
++	"crypto/rand"
++	"os"
+ 
+ 	"github.com/oandrew/ipod"
+ )
+@@ -152,7 +154,11 @@ func HandleGeneral(req *ipod.Command, tr ipod.CommandWriter, dev DeviceGeneral)
+ 			} else {
+ 				ipod.Respond(req, tr, &AckDevAuthenticationInfo{Status: DevAuthInfoStatusSupported})
+ 				dev.AccAuthCert(accCertBuf.Bytes())
+-				ipod.Respond(req, tr, &GetDevAuthenticationSignatureV2{Counter: 0})
++				if os.Getenv("IPOD_NO_SIG") == "" {
++					sig := &GetDevAuthenticationSignatureV2{Counter: 1}
++					rand.Read(sig.Challenge[:])
++					ipod.Respond(req, tr, sig)
++				}
+ 			}
+ 		} else {
+ 			ipod.Respond(req, tr, &AckDevAuthenticationInfo{Status: DevAuthInfoStatusSupported})
